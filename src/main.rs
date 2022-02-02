@@ -1,6 +1,7 @@
 use clap::Parser;
-use glam::{IVec2, Vec3};
+use glam::{IVec2, Vec2, Vec3};
 use image::{imageops, ImageBuffer, Rgba, RgbaImage};
+use rand::{thread_rng, Rng};
 
 mod model;
 
@@ -45,50 +46,62 @@ fn line(t0: IVec2, t1: IVec2, image: &mut RgbaImage, color: Rgba<u8>) {
     }
 }
 
-fn triangle(t0: IVec2, t1: IVec2, t2: IVec2, image: &mut RgbaImage, color: Rgba<u8>) {
-    if t0.y == t1.y && t0.y == t2.y {
-        return;
+fn barycentric(a: Vec3, b: Vec3, c: Vec3, p: Vec3) -> Vec3 {
+    let mut s = [Vec3::ZERO; 2];
+    for i in 0..2 {
+        s[i][0] = c[i] - a[i];
+        s[i][1] = b[i] - a[i];
+        s[i][2] = a[i] - p[i];
     }
-    let mut t0 = t0;
-    let mut t1 = t1;
-    let mut t2 = t2;
-    if t0.y > t1.y {
-        std::mem::swap(&mut t0, &mut t1);
+    let u = s[0].cross(s[1]);
+    if u[2].abs() > 1e-2 {
+        Vec3::new(1.0 - (u.x + u.y) / u.z, u.y / u.z, u.x / u.z)
+    } else {
+        Vec3::new(-1.0, 1.0, 1.0)
     }
-    if t0.y > t2.y {
-        std::mem::swap(&mut t0, &mut t2);
-    }
-    if t1.y > t2.y {
-        std::mem::swap(&mut t1, &mut t2);
-    }
-    let total_height = t2.y - t0.y;
-    for i in 0..total_height {
-        let second_half = i > t1.y - t0.y || t1.y == t0.y;
-        let segment_height = if second_half {
-            t2.y - t1.y
-        } else {
-            t1.y - t0.y
-        };
-        let alpha = i as f32 / total_height as f32;
-        let beta = (i - if second_half { t1.y - t0.y } else { 0 }) as f32 / segment_height as f32;
-        let s0 = t0.as_vec2();
-        let s1 = t1.as_vec2();
-        let s2 = t2.as_vec2();
-        let mut a = s0 + (s2 - s0) * alpha;
-        let mut b = if second_half {
-            s1 + (s2 - s1) * beta
-        } else {
-            s0 + (s1 - s0) * beta
-        };
-        if a.x > b.x {
-            std::mem::swap(&mut a, &mut b);
-        }
-        let a = a.as_ivec2();
-        let b = b.as_ivec2();
-        for j in a.x..=b.x {
-            put_pixel(image, j as u32, (t0.y + i) as u32, color);
+}
+
+fn triangle(pts: [Vec3; 3], zbuffer: &mut [f32], image: &mut RgbaImage, color: Rgba<u8>) {
+    let mut bboxmin = Vec2::new(f32::MAX, f32::MAX);
+    let mut bboxmax = Vec2::new(f32::MIN, f32::MIN);
+    let clamp = Vec2::new(image.width() as f32 - 1.0, image.height() as f32 - 1.0);
+    for i in 0..3 {
+        for j in 0..2 {
+            bboxmin[j] = 0.0f32.max(bboxmin[j].min(pts[i][j]));
+            bboxmax[j] = clamp[j].min(bboxmax[j].max(pts[i][j]));
         }
     }
+    let mut p = Vec3::ZERO;
+    p.x = bboxmin.x;
+    while p.x <= bboxmax.x {
+        p.y = bboxmin.y;
+        while p.y <= bboxmax.y {
+            let bc_screen = barycentric(pts[0], pts[1], pts[2], p);
+            if bc_screen.x < 0.0 || bc_screen.y < 0.0 || bc_screen.z < 0.0 {
+                p.y += 1.0;
+                continue;
+            }
+            p.z = 0.0;
+            for i in 0..3 {
+                p.z += pts[i][2] * bc_screen[i];
+            }
+            let index = (p.x + p.y * image.width() as f32) as usize;
+            if zbuffer[index] < p.z {
+                zbuffer[index] = p.z;
+                put_pixel(image, p.x as u32, p.y as u32, color);
+            }
+            p.y += 1.0;
+        }
+        p.x += 1.0;
+    }
+}
+
+fn world2screen(v: Vec3, width: f32, height: f32) -> Vec3 {
+    Vec3::new(
+        ((v.x + 1.0) * width / 2.0 + 0.5).floor(),
+        ((v.y + 1.0) * height / 2.0 + 0.5).floor(),
+        v.z,
+    )
 }
 
 #[derive(Parser, Debug)]
@@ -111,40 +124,29 @@ fn main() {
     let args = Args::parse();
     let model = model::Model::load_obj(&args.model);
     let mut image: RgbaImage = ImageBuffer::new(args.width, args.height);
-    let light_dir = Vec3::new(0.0, 0.0, -1.0);
+    let mut zbuffer = vec![f32::MIN; (args.width * args.height) as usize];
+
+    let mut rng = thread_rng();
 
     let width = args.width as f32;
     let height = args.height as f32;
     for i in 0..model.nfaces() {
         let face = model.face(i);
-        let mut screen_coords = [IVec2::ZERO; 3];
         let mut world_coords = [Vec3::ZERO; 3];
-        for j in 0..3 {
-            let v = model.vert(face[j]);
-            screen_coords[j] = IVec2::new(
-                ((v.x + 1.0) * width / 2.0) as i32,
-                ((v.y + 1.0) * height / 2.0) as i32,
-            );
-            world_coords[j] = v;
+        for i in 0..3 {
+            world_coords[i] = world2screen(model.vert(face[i]), width, height);
         }
-        let n = (world_coords[2] - world_coords[0])
-            .cross(world_coords[1] - world_coords[0])
-            .normalize();
-        let intensity = n.dot(light_dir);
-        if intensity > 0.0 {
-            triangle(
-                screen_coords[0],
-                screen_coords[1],
-                screen_coords[2],
-                &mut image,
-                Rgba([
-                    (intensity * 255.0) as u8,
-                    (intensity * 255.0) as u8,
-                    (intensity * 255.0) as u8,
-                    255,
-                ]),
-            );
-        }
+        triangle(
+            world_coords,
+            &mut zbuffer,
+            &mut image,
+            Rgba([
+                (rng.gen_range(0.0..1.0) * 255.0) as u8,
+                (rng.gen_range(0.0..1.0) * 255.0) as u8,
+                (rng.gen_range(0.0..1.0) * 255.0) as u8,
+                255,
+            ]),
+        );
     }
 
     imageops::flip_vertical_in_place(&mut image);
